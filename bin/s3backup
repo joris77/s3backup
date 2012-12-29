@@ -1,0 +1,210 @@
+#!/usr/bin/env ruby
+require 'gli'
+require "rubygems"
+require "aws-sdk"
+require "yaml"
+require "fileutils"
+require "socket"
+require File.join(File.dirname(__FILE__), "../lib", 's3backup')
+
+include GLI::App
+
+program_desc 'Tool for backing up and restoring mysql databases to and from S3.'
+
+version S3backup::VERSION
+
+desc 'User'
+default_value 'backup'
+arg_name 'Backup user'
+flag [:u, :user]
+
+desc 'Password'
+arg_name 'Password'
+flag [:p, :password]
+
+desc 'Configuration for AWS and directories'
+default_value './config.yml'
+arg_name 'Configuration'
+flag [:c, :configuration]
+
+desc 'Bucket for backups'
+arg_name 'Bucket'
+flag [:b, :bucket]
+
+desc 'Creates a full backup to S3'
+arg_name 'Describe arguments to full here'
+
+command :full do |c|
+
+  c.action do |global_options, options, args|
+
+    bucket = get_bucket(global_options)
+
+    database = args[0]
+
+    database_dir = get_database_dir(database)
+
+    dump_file_name = get_full_backup_file_name
+
+    # delete all incremental backup files
+    bucket.objects.with_prefix(database_dir).delete_if { |o| o.key.include?("-bin.") }
+
+    user = global_options[:user]
+    password = global_options[:password]
+
+
+    # assumes the bucket's empty
+    dump_file = "#{@temp_dir}/#{dump_file_name}"
+
+    cmd = "mysqldump --quick --single-transaction --create-options -u #{user} --flush-logs --master-data=2 --delete-master-logs"
+    cmd += " -p'#{password}'" unless password.nil?
+    cmd += " #{database} | gzip > #{dump_file}"
+    run_system(cmd)
+
+    bucket.objects.create("#{database_dir}/#{dump_file_name}", open(dump_file))
+  end
+end
+
+desc 'Executes incremental backup to S3'
+arg_name 'database to backup'
+command :inc do |c|
+  c.action do |global_options, options, args|
+    user = global_options[:user]
+    password = global_options[:password]
+    execute_sql "flush logs", user, password
+    logs = Dir.glob("#{@mysql_bin_log_dir}/*-bin.[0-9]*").sort
+    logs_to_archive = logs[0..-2] # all logs except the last
+
+    bucket = get_bucket global_options
+
+    logs_to_archive.each do |log|
+      bucket.objects.create("#{get_database_dir(args[0])}/#{File.basename(log)}", open(log))
+    end
+    if logs[-1] then
+      execute_sql "purge master logs to '#{File.basename(logs[-1])}'", user, password
+    end
+  end
+end
+
+desc 'Describe restore here'
+arg_name 'Describe arguments to restore here'
+command :restore do |c|
+  c.desc 'Restore the binary logs'
+  c.switch [:l, :logs]
+
+  c.desc 'IP address of server without the dots'
+  c.arg_name 'Ip'
+  c.default_value get_ip
+  c.flag [:i, :ip]
+
+  c.desc 'Time of the backup to restore'
+  c.arg_name 'Time'
+  c.flag [:t, :time]
+  c.action do |global_options, options, args|
+    time = options[:time]
+
+    unless time then
+      raise "Option time is required"
+    end
+
+    user = global_options[:user]
+    password = global_options[:password]
+
+    ip = options[:ip]
+
+    bucket = get_bucket global_options
+
+    from_database = args[0]
+    to_database = args[1]
+
+    unless to_database then
+      to_database = from_database
+    end
+
+    database_dir = get_database_dir(from_database, ip)
+
+    full_backup_file_name = get_full_backup_file_name(time)
+
+    backup_file_key = "#{database_dir}/#{full_backup_file_name}"
+    unless bucket.objects[backup_file_key].exists? then
+      raise "Dump #{backup_file_key} does not not exist in bucket #{bucket.name}"
+    end
+    retrieve_file(bucket, database_dir, full_backup_file_name)
+
+    # restore the dump file
+    cmd = "gunzip -c #{@temp_dir}/#{full_backup_file_name} | mysql -u #{user} "
+    cmd += " -p'#{password}' " unless password.nil?
+    cmd += " #{to_database}"
+    run_system cmd
+
+    if options[:logs] then
+
+      binary_log_objects = bucket.objects.with_prefix(database_dir).select { |obj| obj.key.match(/.*-bin\.[0-9]{6}/) }
+      binary_log_objects.each do |o|
+        File.open("#{@temp_dir}/#{File.basename(o.key)}", 'w') do |f|
+          o.read do |chunk|
+            f.write(chunk)
+          end
+        end
+      end
+
+
+      logs = Dir.glob("#{@temp_dir}/*-bin.[0-9]*").sort
+
+      # restore the binary log files
+      logs.each do |log|
+        # The following will be executed for each binary log file
+        cmd = "mysqlbinlog --database=#{from_database} #{log} | mysql -u #{user} "
+        cmd += " -p'#{password}' " unless password.nil?
+        cmd += " #{to_database}"
+        run_system cmd
+      end
+    end
+  end
+end
+
+pre do |global, command, options, args|
+  if args.empty? then
+    raise "Database name is required."
+  end
+
+  confPath = global[:configuration]
+
+  config_file = File.join(File.dirname(__FILE__),
+                          confPath)
+
+  unless File.exist?(config_file) then
+    raise "File #{config_file} does not exist."
+  end
+
+  config = YAML.load(File.read(config_file))
+
+  unless config.kind_of?(Hash) then
+    raise "config.yml is formatted incorrectly.  Please use the following format: \naccess_key_id: YOUR_ACCESS_KEY_ID\nsecret_access_key: YOUR_SECRET_ACCESS_KEY"
+  end
+
+  @mysql_bin_log_dir = config["mysql_bin_log_dir"]
+  @temp_dir = config["temp_dir"]
+
+  AWS.config({
+                 :access_key_id => config["access_key_id"],
+                 :secret_access_key => config["secret_access_key"],
+                 :s3_endpoint => config["s3_endpoint"]
+             })
+
+  FileUtils.mkdir_p @temp_dir
+
+  true
+end
+
+post do |global, command, options, args|
+  FileUtils.rm_rf(@temp_dir)
+end
+
+on_error do |exception|
+  # Error logic here
+  # return false to skip default error handling
+  true
+end
+
+exit run(ARGV)

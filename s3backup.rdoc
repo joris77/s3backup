@@ -1,0 +1,5 @@
+= s3backup
+
+Generate this with
+    s3backup rdoc
+After you have described your command line interface
