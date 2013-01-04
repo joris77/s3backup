@@ -10,7 +10,7 @@ Rake::RDocTask.new do |rd|
   rd.title = 'Your application title'
 end
 
-spec = eval(File.read('s3backup.gemspec'))
+spec = eval(File.read('s3mybackup.gemspec'))
 
 Gem::PackageTask.new(spec) do |pkg|
 end

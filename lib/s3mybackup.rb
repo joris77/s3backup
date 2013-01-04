@@ -1,3 +1,5 @@
+require 's3mybackup/version.rb'
+
 def run_system(command)
   result = system(command)
   raise("error, process exited with status #{$?.exitstatus}") unless result
@@ -26,15 +28,12 @@ def get_ip
 end
 
 def get_database_dir(database,ip = get_ip)
-
   database_dir = "#{ip}/#{database}"
 end
 
 def get_full_backup_file_name(time_string = (Time.now).strftime('%Y%m%d%H%M%S'))
   "#{time_string}dump.sql.gz"
 end
-
-
 
 def retrieve_file(bucket,database_dir,file_name)
 

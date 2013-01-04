@@ -5,27 +5,60 @@ require "aws-sdk"
 require "yaml"
 require "fileutils"
 require "socket"
-require File.join(File.dirname(__FILE__), "../lib", 's3backup')
+require File.join(File.dirname(__FILE__), "../lib", 's3mybackup')
 
 include GLI::App
 
 program_desc 'Tool for backing up and restoring mysql databases to and from S3.'
 
-version S3backup::VERSION
+version = S3mybackup::VERSION
+
+config_file = File.join(".","config.yml")
+
+unless File.exist?(config_file) then
+  raise "File #{config_file} does not exist."
+end
+
+defaults = YAML.load(File.read(config_file))
+
+unless defaults.kind_of?(Hash) then
+  raise "config.yml is formatted incorrectly.  Please use the following format: \naccess_key_id: YOUR_ACCESS_KEY_ID\nsecret_access_key: YOUR_SECRET_ACCESS_KEY"
+end
 
 desc 'User'
-default_value 'backup'
+default_value defaults[:user] || 'backup'
 arg_name 'Backup user'
 flag [:u, :user]
 
 desc 'Password'
+default_value defaults[:password]
 arg_name 'Password'
 flag [:p, :password]
 
-desc 'Configuration for AWS and directories'
-default_value './config.yml'
-arg_name 'Configuration'
-flag [:c, :configuration]
+desc 'Directory where mysql writes binary logs. log-bin = in my.cnf'
+default_value defaults[:mysql_bin_log_dir]
+arg_name 'mysql_bin_log_dir'
+flag [:l, :mysql_bin_log_dir]
+
+desc 'Temporary directory where files are stored before writing to and after download from S3 (absolute path)'
+default_value defaults[:temp_dir]
+arg_name 'mysql_bin_log_dir'
+flag [:t, :temp_dir]
+
+desc 'Access key S3'
+default_value defaults[:access_key_id]
+arg_name 'access_key_id'
+flag [:a, :access_key_id]
+
+desc 'Secret access key S3'
+default_value defaults[:secret_access_key]
+arg_name 'secret_access_key'
+flag [:s, :secret_access_key]
+
+desc 'Secret access key S3'
+default_value defaults[:s3_endpoint]
+arg_name 's3_endpoint'
+flag [:e, :s3_endpoint]
 
 desc 'Bucket for backups'
 arg_name 'Bucket'
@@ -89,7 +122,7 @@ end
 desc 'Describe restore here'
 arg_name 'Describe arguments to restore here'
 command :restore do |c|
-  c.desc 'Restore the binary logs'
+  c.desc 'Restore the binary logs without only the dump of mysqldump is restored'
   c.switch [:l, :logs]
 
   c.desc 'IP address of server without the dots'
@@ -114,14 +147,9 @@ command :restore do |c|
 
     bucket = get_bucket global_options
 
-    from_database = args[0]
-    to_database = args[1]
+    database = args[0]
 
-    unless to_database then
-      to_database = from_database
-    end
-
-    database_dir = get_database_dir(from_database, ip)
+    database_dir = get_database_dir(database, ip)
 
     full_backup_file_name = get_full_backup_file_name(time)
 
@@ -134,7 +162,7 @@ command :restore do |c|
     # restore the dump file
     cmd = "gunzip -c #{@temp_dir}/#{full_backup_file_name} | mysql -u #{user} "
     cmd += " -p'#{password}' " unless password.nil?
-    cmd += " #{to_database}"
+    cmd += " #{database}"
     run_system cmd
 
     if options[:logs] then
@@ -154,9 +182,9 @@ command :restore do |c|
       # restore the binary log files
       logs.each do |log|
         # The following will be executed for each binary log file
-        cmd = "mysqlbinlog --database=#{from_database} #{log} | mysql -u #{user} "
+        cmd = "mysqlbinlog --database=#{database} #{log} | mysql -u #{user} "
         cmd += " -p'#{password}' " unless password.nil?
-        cmd += " #{to_database}"
+        cmd += " #{database}"
         run_system cmd
       end
     end
@@ -168,28 +196,17 @@ pre do |global, command, options, args|
     raise "Database name is required."
   end
 
-  confPath = global[:configuration]
-
-  config_file = File.join(File.dirname(__FILE__),
-                          confPath)
-
-  unless File.exist?(config_file) then
-    raise "File #{config_file} does not exist."
+  if args.length > 1 then
+    raise "Only one argument, database, is allowed."
   end
 
-  config = YAML.load(File.read(config_file))
-
-  unless config.kind_of?(Hash) then
-    raise "config.yml is formatted incorrectly.  Please use the following format: \naccess_key_id: YOUR_ACCESS_KEY_ID\nsecret_access_key: YOUR_SECRET_ACCESS_KEY"
-  end
-
-  @mysql_bin_log_dir = config["mysql_bin_log_dir"]
-  @temp_dir = config["temp_dir"]
+  @mysql_bin_log_dir = global[:mysql_bin_log_dir]
+  @temp_dir = global[:temp_dir]
 
   AWS.config({
-                 :access_key_id => config["access_key_id"],
-                 :secret_access_key => config["secret_access_key"],
-                 :s3_endpoint => config["s3_endpoint"]
+                 :access_key_id => global[:access_key_id],
+                 :secret_access_key => global[:secret_access_key],
+                 :s3_endpoint => global[:s3_endpoint]
              })
 
   FileUtils.mkdir_p @temp_dir

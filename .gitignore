@@ -3,3 +3,4 @@ config.yml
 *.iws
 *.ipr
 tmp
+pkg

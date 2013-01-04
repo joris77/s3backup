@@ -2,5 +2,5 @@
 
 Describe your project here
 
-:include:s3backup.rdoc
+:include:s3mybackup.rdoc
 
